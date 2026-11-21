@@ -33,6 +33,22 @@ supports ASCII: accented Latin letters are simplified and other characters
 appear as `?`. The transport icon does not indicate playback state. Firmware and
 the Python companion must be updated together for artwork and title transfer.
 
+## News screen
+
+Swipe horizontally across the touchscreen to switch between music and news.
+The news page rotates Wikipedia's curated "In the news" headlines, with a
+related Wikimedia image, a large scrolling headline, and text and image
+attribution accessible by tapping the image (tap again to return). Stories
+rotate every 15+ seconds; tap the headline to skip ahead, and the dots in the
+bottom bar show which story is displayed. It refreshes
+every 15 minutes while open; each story uses the first linked article with a
+usable public-domain or Creative Commons image, and stories with none are
+skipped, so the number of headlines varies.
+The companion fetches news and images over HTTPS; no API key is required.
+If the feed is unavailable, the page reports it rather than inventing a story.
+Swipe again to return to the music controls. The 200x200 image is resized to
+fit without cropping; image license and source links appear on the credits view.
+
 ## Setup
 
 1. Install PlatformIO and connect the board with a USB data cable.

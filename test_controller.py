@@ -6,6 +6,7 @@ from unittest.mock import patch
 from PIL import Image
 
 import controller
+import news
 
 
 class FakePort:
@@ -30,6 +31,10 @@ class FakePort:
             self.received.extend(b"MIC_OK\r\n")
         elif data.startswith(b"TITLE:"):
             self.received.extend(b"TITLE_OK\r\n")
+        elif data.startswith(b"NEWS:"):
+            self.received.extend(b"NEWS_OK\r\n")
+        elif data.startswith(b"STORY:"):
+            self.received.extend(b"STORY_OK\r\n")
         else:
             self.received.extend(b"ROW\r\n")
 
@@ -94,6 +99,35 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(controller.display_track(metadata), "Song")
         metadata.title = " \n "
         self.assertEqual(controller.display_track(metadata), "No track playing")
+
+    def test_news_page_and_headline_protocol(self):
+        port = FakePort()
+        device = controller.Device(port)
+        device.handle("PAGE:NEWS")
+        self.assertEqual(device.page, "NEWS")
+        device.set_news("Headline | attribution")
+        device.set_story(2, 5)
+        self.assertEqual(port.writes, [b"NEWS:Headline | attribution\n", b"STORY:2/5\n"])
+        device.handle("NEXT_STORY")
+        self.assertTrue(device.skip_story)
+        device.handle("PAGE:MEDIA")
+        self.assertEqual(device.page, "MEDIA")
+
+    def test_story_duration_ignores_attribution(self):
+        story = "Short headline | Wikipedia CC BY-SA 4.0: " + "x" * 1000
+        self.assertEqual(controller.story_seconds(story), 15)
+
+    def test_parse_curated_headlines_only(self):
+        parser = news.HeadlinesParser(controller.display_text)
+        parser.feed('<div>Intro</div><ul><li>Some <a title="Place">place</a> <b><a title="Topic">news</a></b>.</li>'
+                    '<li><b><a title="Another">More</a></b> here.</li></ul>'
+                    '<ul><li><b><a title="Footer">Ignore</a></b></li></ul>')
+        self.assertEqual(parser.headlines, [("Some place news .", ["Topic", "Place"]),
+                                            ("More here.", ["Another"])])
+
+    def test_news_rejects_untrusted_image_hosts(self):
+        with self.assertRaises(ValueError):
+            news.read_url("https://example.com/image.jpg", 100)
 
 
 if __name__ == "__main__":

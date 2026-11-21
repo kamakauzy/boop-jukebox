@@ -28,6 +28,7 @@ constexpr int kCalibrationY[] = {25, 25, 215, 215};
 
 TFT_eSPI display;
 TFT_eSprite banner = TFT_eSprite(&display);
+TFT_eSprite headline = TFT_eSprite(&display);
 SPIClass touchSpi(VSPI);
 XPT2046_Touchscreen touch(kTouchCs, kTouchIrq);
 Preferences preferences;
@@ -40,13 +41,23 @@ TouchCalibration calibration;
 bool calibrating = false;
 int calibrationPoint = 0;
 bool wasTouched = false;
+bool newsPage = false;
+bool newsCredits = false;
+float touchStartX = 0, touchStartY = 0, touchLastX = 0, touchLastY = 0;
+int pressedButton = -1;
 enum class MuteState { Unknown, Unmuted, Muted };
 MuteState muteState = MuteState::Unknown;
 unsigned long lastMuteUpdate = 0;
 String trackTitle = "No track playing";
+String newsTitle = "Loading Wikimedia headlines...";
 int bannerOffset = 0;
 unsigned long lastBannerUpdate = 0;
 bool bannerAvailable = false;
+bool headlineAvailable = false;
+int headlineOffset = 0;
+unsigned long lastHeadlineUpdate = 0;
+int storyIndex = 0;
+int storyCount = 0;
 
 enum class Icon { Previous, PlayPause, Next, Microphone };
 
@@ -119,30 +130,102 @@ void drawButton(const Button& button, bool pressed = false) {
 }
 
 void drawBanner() {
-  if (!bannerAvailable) return;
+  if (!bannerAvailable || newsPage) return;
   banner.fillSprite(kBanner);
   banner.fillRect(0, 0, 3, 20, kAccent);
   banner.setTextColor(kText, kBanner);
   banner.setTextFont(2);
   banner.setTextDatum(ML_DATUM);
-  const int textWidth = banner.textWidth(trackTitle);
+  const String& title = newsPage ? newsTitle : trackTitle;
+  const int textWidth = banner.textWidth(title);
   const int viewport = kBannerWidth - 16;
   if (textWidth <= viewport) {
-    banner.drawString(trackTitle, 10, 10);
+    banner.drawString(title, 10, 10);
   } else {
     int cycle = textWidth + 40;
-    banner.drawString(trackTitle, 10 - bannerOffset, 10);
-    banner.drawString(trackTitle, 10 - bannerOffset + cycle, 10);
+    banner.drawString(title, 10 - bannerOffset, 10);
+    banner.drawString(title, 10 - bannerOffset + cycle, 10);
     bannerOffset = (bannerOffset + 2) % cycle;
   }
   banner.pushSprite(8, kBannerY);
+}
+
+void drawHeadline() {
+  if (!headlineAvailable) return;
+  headline.fillSprite(kBackground);
+  headline.setTextColor(kText, kBackground);
+  if (newsCredits) {
+    headline.setTextFont(2);
+  } else {
+    headline.setFreeFont(&FreeSans9pt7b);
+  }
+  headline.setTextDatum(TL_DATUM);
+  int end = newsTitle.indexOf(" | Wikipedia");
+  String text = !newsCredits && end >= 0 ? newsTitle.substring(0, end) : newsTitle;
+  const int width = 96;
+  const int lineHeight = newsCredits ? 18 : 23;
+  String line;
+  int lineY = 3 - headlineOffset;
+  for (unsigned int i = 0; i <= text.length(); ++i) {
+    char ch = i < text.length() ? text.charAt(i) : '\0';
+    if (ch == ' ' || ch == '\0') {
+      if (ch == ' ' && line.length() > 0) line += ' ';
+      if (ch == '\0' && line.length() > 0) {
+        headline.drawString(line, 2, lineY);
+        lineY += lineHeight;
+      }
+      continue;
+    }
+    int nextSpace = text.indexOf(' ', i);
+    if (nextSpace < 0) nextSpace = text.length();
+    String word = text.substring(i, nextSpace);
+    if (line.length() && headline.textWidth(line + word) > width) {
+      headline.drawString(line, 2, lineY);
+      lineY += lineHeight;
+      line = "";
+    }
+    for (unsigned int j = 0; j < word.length(); ++j) {
+      if (line.length() && headline.textWidth(line + word.charAt(j)) > width) {
+        headline.drawString(line, 2, lineY);
+        lineY += lineHeight;
+        line = "";
+      }
+      line += word.charAt(j);
+    }
+    i = nextSpace - 1;
+  }
+  const int textHeight = lineY + headlineOffset;
+  if (textHeight > 200) {
+    headlineOffset += 5;
+    if (headlineOffset > textHeight + 20) headlineOffset = 0;
+  }
+  headline.pushSprite(215, 6);
+}
+
+void drawStoryDots() {
+  if (!newsPage) return;
+  display.fillRoundRect(8, kBannerY, kBannerWidth, 20, 10, kBanner);
+  const int count = min(storyCount, 12);
+  if (count <= 0) return;
+  const int spacing = 16;
+  const int activeWidth = 18;
+  int x = 160 - ((count - 1) * spacing + activeWidth) / 2;
+  for (int i = 1; i <= count; ++i) {
+    if (i == storyIndex) {
+      display.fillRoundRect(x, kBannerY + 7, activeWidth, 6, 3, kAccent);
+      x += activeWidth + spacing - 6;
+    } else {
+      display.fillCircle(x + 3, kBannerY + 10, 3, 0x6B4D);
+      x += spacing;
+    }
+  }
 }
 
 void clearArtwork() {
   display.fillRect(kArtX, kArtY, kArtSize, kArtSize, kSurface);
   display.setTextColor(kText, kSurface);
   display.setTextDatum(MC_DATUM);
-  display.drawString("No artwork", kArtX + kArtSize / 2,
+  display.drawString(newsPage ? "Loading news" : "No artwork", kArtX + kArtSize / 2,
                      kArtY + kArtSize / 2);
 }
 
@@ -162,10 +245,16 @@ void drawInterface() {
   display.setTextColor(kText, kBackground);
   display.setTextDatum(MC_DATUM);
   clearArtwork();
-  for (const Button& button : buttons) {
-    drawButton(button);
+  if (newsPage) {
+    headlineOffset = 0;
+    drawHeadline();
+    drawStoryDots();
+  } else {
+    for (const Button& button : buttons) {
+      drawButton(button);
+    }
   }
-  display.drawFastHLine(8, kBannerY - 2, kBannerWidth, 0x4A8A);
+  if (!newsPage) display.drawFastHLine(8, kBannerY - 2, kBannerWidth, 0x4A8A);
   bannerOffset = 0;
   drawBanner();
 }
@@ -262,6 +351,7 @@ void receiveArtwork() {
 }  // namespace
 
 void setup() {
+  Serial.setRxBufferSize(2048);
   Serial.begin(115200);
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
@@ -273,6 +363,11 @@ void setup() {
   bannerAvailable = banner.createSprite(kBannerWidth, 20) != nullptr;
   if (!bannerAvailable) {
     Serial.println("ERROR: banner allocation failed");
+  }
+  headline.setColorDepth(16);
+  headlineAvailable = headline.createSprite(100, 200) != nullptr;
+  if (!headlineAvailable) {
+    Serial.println("ERROR: headline allocation failed");
   }
   touchSpi.begin(kTouchSck, kTouchMiso, kTouchMosi, kTouchCs);
   if (!touch.begin(touchSpi)) {
@@ -302,7 +397,7 @@ void loop() {
     String command = Serial.readStringUntil('\n');
     command.trim();
     if (command == "PING") {
-      Serial.println(calibrating ? "STATUS_CAL" : "STATUS_READY");
+      Serial.println(calibrating ? "STATUS_CAL" : newsPage ? "STATUS_NEWS" : "STATUS_READY");
     } else if (command == "CAL") {
       startCalibration();
     } else if (calibrating) {
@@ -312,7 +407,7 @@ void loop() {
                             : command == "MIC:0" ? MuteState::Unmuted : MuteState::Unknown;
       if (nextState != muteState) {
         muteState = nextState;
-        drawButton(buttons[3]);
+        if (!newsPage) drawButton(buttons[3]);
       }
       lastMuteUpdate = millis();
       Serial.println("MIC_OK");
@@ -325,8 +420,21 @@ void loop() {
       trackTitle = command.substring(6);
       if (trackTitle.length() == 0) trackTitle = "No track playing";
       bannerOffset = 0;
-      drawBanner();
+      if (!newsPage) drawBanner();
       Serial.println("TITLE_OK");
+    } else if (command.startsWith("NEWS:")) {
+      newsTitle = command.substring(5);
+      if (newsTitle.length() == 0) newsTitle = "News unavailable";
+      bannerOffset = 0;
+      headlineOffset = 0;
+      if (newsPage) drawHeadline();
+      Serial.println("NEWS_OK");
+    } else if (command.startsWith("STORY:")) {
+      int slash = command.indexOf('/');
+      storyIndex = slash > 6 ? command.substring(6, slash).toInt() : 0;
+      storyCount = slash > 6 ? command.substring(slash + 1).toInt() : 0;
+      drawStoryDots();
+      Serial.println("STORY_OK");
     } else {
       Serial.println("ERROR: unknown command");
     }
@@ -334,11 +442,15 @@ void loop() {
   if (!calibrating && muteState != MuteState::Unknown &&
       millis() - lastMuteUpdate > 15000) {
     muteState = MuteState::Unknown;
-    drawButton(buttons[3]);
+    if (!newsPage) drawButton(buttons[3]);
   }
   if (!calibrating && millis() - lastBannerUpdate >= 50) {
     lastBannerUpdate = millis();
     drawBanner();
+  }
+  if (!calibrating && newsPage && millis() - lastHeadlineUpdate >= 70) {
+    lastHeadlineUpdate = millis();
+    drawHeadline();
   }
   const bool isTouched = touch.touched();
   if (isTouched && !wasTouched) {
@@ -348,11 +460,15 @@ void loop() {
     } else {
       float x, y;
       if (mapTouch(calibration, point.x, point.y, x, y)) {
-        for (const Button& button : buttons) {
+        touchStartX = touchLastX = x;
+        touchStartY = touchLastY = y;
+        pressedButton = -1;
+        for (size_t i = 0; !newsPage && i < sizeof(buttons) / sizeof(buttons[0]); ++i) {
+          const Button& button = buttons[i];
           const float dx = x - button.x;
           const float dy = y - button.y;
           if (dx * dx + dy * dy <= button.radius * button.radius) {
-            Serial.println(button.command);
+            pressedButton = i;
             drawButton(button, true);
             break;
           }
@@ -360,10 +476,35 @@ void loop() {
       }
     }
   }
+  if (isTouched && wasTouched && !calibrating) {
+    TS_Point point = touch.getPoint();
+    mapTouch(calibration, point.x, point.y, touchLastX, touchLastY);
+  }
   if (!isTouched && wasTouched && !calibrating) {
-    for (const Button& button : buttons) {
+    float dx = touchLastX - touchStartX;
+    float dy = touchLastY - touchStartY;
+    if (fabsf(dx) >= 55 && fabsf(dx) > fabsf(dy) * 1.5f) {
+      newsPage = !newsPage;
+      newsCredits = false;
+      drawInterface();
+      Serial.println(newsPage ? "PAGE:NEWS" : "PAGE:MEDIA");
+    } else if (newsPage && fabsf(dx) < 20 && fabsf(dy) < 20 &&
+               (newsCredits || (touchStartX < 210 && touchStartY < 210))) {
+      newsCredits = !newsCredits;
+      headlineOffset = 0;
+      drawHeadline();
+    } else if (newsPage && fabsf(dx) < 20 && fabsf(dy) < 20 && storyCount > 1) {
+      Serial.println("NEXT_STORY");
+    } else if (!newsPage && pressedButton >= 0) {
+      const Button& button = buttons[pressedButton];
+      float bx = touchLastX - button.x;
+      float by = touchLastY - button.y;
+      if (bx * bx + by * by <= button.radius * button.radius) {
+        Serial.println(button.command);
+      }
       drawButton(button);
     }
+    pressedButton = -1;
   }
   wasTouched = isTouched;
   delay(30);

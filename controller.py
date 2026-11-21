@@ -10,6 +10,7 @@ import subprocess
 import time
 import unicodedata
 
+import news
 from PIL import Image, ImageOps
 import serial
 from winrt.windows.media.control import (
@@ -117,14 +118,15 @@ def artwork_pixels(data):
     return bytes(result)
 
 
-def display_text(text):
+def display_text(text, max_length=160):
     normalized = unicodedata.normalize("NFKD", text or "")
     ascii_title = "".join(
         char if 32 <= ord(char) <= 126 else " " if char.isspace()
         else "" if unicodedata.combining(char) else "?"
         for char in normalized
     )
-    return " ".join(ascii_title.split())[:160]
+    result = " ".join(ascii_title.split())
+    return result if max_length is None else result[:max_length]
 
 
 def display_track(properties):
@@ -157,10 +159,17 @@ async def spotify_artwork(properties):
         stream.close()
 
 
+def story_seconds(story):
+    headline = story.split(" | Wikipedia", 1)[0]
+    return max(15, len(headline) * 0.12)
+
+
 class Device:
     def __init__(self, port):
         self.port = port
         self.pending = bytearray()
+        self.page = "MEDIA"
+        self.skip_story = False
 
     def read_message(self):
         while self.port.in_waiting:
@@ -175,7 +184,12 @@ class Device:
         return None
 
     def handle(self, message):
-        if message in KEYS:
+        if message in ("PAGE:NEWS", "PAGE:MEDIA"):
+            self.page = message[5:]
+            print(f"Display page: {self.page}", flush=True)
+        elif message == "NEXT_STORY":
+            self.skip_story = True
+        elif message in KEYS:
             press_keys(KEYS[message])
             print(f"Sent {message}", flush=True)
         elif message and message != "STARTED":
@@ -211,6 +225,14 @@ class Device:
     def set_title(self, title):
         self.port.write(f"TITLE:{title}\n".encode("ascii"))
         self.wait_for("TITLE_OK")
+
+    def set_news(self, headline):
+        self.port.write(f"NEWS:{headline}\n".encode("ascii"))
+        self.wait_for("NEWS_OK")
+
+    def set_story(self, index, count):
+        self.port.write(f"STORY:{index}/{count}\n".encode("ascii"))
+        self.wait_for("STORY_OK")
 
     def set_mute_state(self, muted):
         if muted is not None and type(muted) is not bool:
@@ -263,15 +285,62 @@ async def run_device(port_name, calibrate, state, reader):
         last_mute = object()
         last_mute_error = None
         next_mute_poll = 0
+        last_page = None
+        stories = []
+        news_task = None
+        news_index = 0
+        next_news_refresh = 0
+        next_news_story = 0
+        news_dirty = True
         while True:
             if reader.done():
                 await reader
             message = device.read_message()
             if message:
                 device.handle(message)
+            if device.page != last_page:
+                last_page = device.page
+                last_art = object()
+                news_dirty = True
+                next_poll = 0
+            now = time.monotonic()
+            if device.page == "NEWS" and news_task is None and now >= next_news_refresh:
+                news_task = asyncio.create_task(
+                    asyncio.to_thread(news.fetch_news, display_text, artwork_pixels)
+                )
+                next_news_refresh = now + 900
+                if not stories:
+                    device.set_news("Loading Wikipedia headlines...")
+            if news_task is not None and news_task.done():
+                try:
+                    stories = news_task.result()
+                    news_index = 0
+                    news_dirty = True
+                    next_news_story = time.monotonic() + story_seconds(stories[0][0])
+                    print(f"Loaded {len(stories)} Wikimedia news stories", flush=True)
+                except (OSError, RuntimeError, ValueError, KeyError) as error:
+                    print(f"Could not load Wikimedia news: {error}", flush=True)
+                    if not stories:
+                        device.set_news("News unavailable - check connection | Wikipedia")
+                news_task = None
+            if device.page == "NEWS" and stories:
+                if device.skip_story or time.monotonic() >= next_news_story:
+                    device.skip_story = False
+                    news_index = (news_index + 1) % len(stories)
+                    news_dirty = True
+                    next_news_story = time.monotonic() + story_seconds(stories[news_index][0])
+                if news_dirty:
+                    headline, image = stories[news_index]
+                    device.set_news(headline)
+                    device.set_story(news_index + 1, len(stories))
+                    device.send_artwork(image)
+                    news_dirty = False
             if time.monotonic() >= next_poll:
                 port.write(b"PING\n")
-                is_calibrating = device.wait_for("STATUS_READY", "STATUS_CAL") == "STATUS_CAL"
+                status = device.wait_for("STATUS_READY", "STATUS_NEWS", "STATUS_CAL")
+                is_calibrating = status == "STATUS_CAL"
+                if not is_calibrating:
+                    device.page = "NEWS" if status == "STATUS_NEWS" else "MEDIA"
                 if is_calibrating:
                     if was_calibrating is not True:
                         print("Touch each crosshair on the display to calibrate.", flush=True)
@@ -304,7 +373,7 @@ async def run_device(port_name, calibrate, state, reader):
                     print(f"Could not read Spotify artwork: {error}", flush=True)
                     pixels = None
                 digest = hashlib.sha256(pixels).digest() if pixels is not None else None
-                if digest != last_art:
+                if device.page == "MEDIA" and digest != last_art:
                     if pixels is None:
                         device.clear_artwork()
                         print("Spotify artwork unavailable", flush=True)
