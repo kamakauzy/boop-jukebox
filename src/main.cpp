@@ -13,17 +13,21 @@ constexpr int kTouchMosi = 32;
 
 constexpr int kTouchRotation = 3;
 constexpr int kArtX = 8;
-constexpr int kArtY = 20;
+constexpr int kArtY = 6;
 constexpr int kArtSize = 200;
 constexpr uint16_t kBackground = 0x0863;
 constexpr uint16_t kSurface = 0x1947;
 constexpr uint16_t kAccent = 0x36CE;
 constexpr uint16_t kDiscord = 0x7B9F;
 constexpr uint16_t kText = 0xE73C;
+constexpr uint16_t kBanner = 0x10A5;
+constexpr int kBannerY = 216;
+constexpr int kBannerWidth = 304;
 constexpr int kCalibrationX[] = {25, 295, 295, 25};
 constexpr int kCalibrationY[] = {25, 25, 215, 215};
 
 TFT_eSPI display;
+TFT_eSprite banner = TFT_eSprite(&display);
 SPIClass touchSpi(VSPI);
 XPT2046_Touchscreen touch(kTouchCs, kTouchIrq);
 Preferences preferences;
@@ -36,6 +40,13 @@ TouchCalibration calibration;
 bool calibrating = false;
 int calibrationPoint = 0;
 bool wasTouched = false;
+enum class MuteState { Unknown, Unmuted, Muted };
+MuteState muteState = MuteState::Unknown;
+unsigned long lastMuteUpdate = 0;
+String trackTitle = "No track playing";
+int bannerOffset = 0;
+unsigned long lastBannerUpdate = 0;
+bool bannerAvailable = false;
 
 enum class Icon { Previous, PlayPause, Next, Microphone };
 
@@ -49,16 +60,30 @@ struct Button {
 };
 
 const Button buttons[] = {
-    {264, 32, 24, kSurface, Icon::Previous, "PREV"},
-    {264, 88, 24, kAccent, Icon::PlayPause, "PLAY"},
-    {264, 144, 24, kSurface, Icon::Next, "NEXT"},
-    {264, 200, 24, kDiscord, Icon::Microphone, "MUTE"},
+    {264, 25, 22, kSurface, Icon::Previous, "PREV"},
+    {264, 78, 22, kAccent, Icon::PlayPause, "PLAY"},
+    {264, 131, 22, kSurface, Icon::Next, "NEXT"},
+    {264, 184, 22, kDiscord, Icon::Microphone, "MUTE"},
 };
 
 void drawButton(const Button& button, bool pressed = false) {
   const int x = button.x;
   const int y = button.y;
-  display.fillCircle(x, y, button.radius, pressed ? TFT_WHITE : button.color);
+  uint16_t color = button.color;
+  if (button.icon == Icon::Microphone) {
+    color = muteState == MuteState::Muted ? TFT_RED
+            : muteState == MuteState::Unmuted ? kDiscord : kSurface;
+  }
+  const uint16_t fill = pressed ? TFT_WHITE : color;
+  display.fillCircle(x, y + 3, button.radius, 0x0000);
+  display.fillCircle(x, y, button.radius, pressed ? 0x8C71 : 0x632D);
+  display.fillCircle(x, y + (pressed ? 2 : 0), button.radius - 3, fill);
+  if (!pressed) {
+    display.drawArc(x, y - 1, button.radius - 4, button.radius - 5,
+                    220, 320, 0xBDF7, fill, true);
+    display.drawArc(x, y + 1, button.radius - 4, button.radius - 5,
+                    40, 140, 0x0863, fill, true);
+  }
   const uint16_t ink = pressed || button.icon == Icon::PlayPause
                            ? kBackground : kText;
   switch (button.icon) {
@@ -78,11 +103,39 @@ void drawButton(const Button& button, bool pressed = false) {
     case Icon::Microphone:
       display.fillRoundRect(x - 5, y - 13, 11, 19, 5, ink);
       display.drawSmoothArc(x, y + 1, 11, 9, 270, 90, ink,
-                            pressed ? TFT_WHITE : button.color, true);
+                            fill, true);
       display.fillRect(x - 1, y + 11, 3, 5, ink);
       display.fillRoundRect(x - 7, y + 15, 15, 3, 1, ink);
+      if (muteState == MuteState::Muted) {
+        display.drawLine(x - 15, y + 14, x + 15, y - 14, ink);
+        display.drawLine(x - 15, y + 13, x + 15, y - 15, ink);
+      } else if (muteState == MuteState::Unknown) {
+        display.setTextColor(ink, fill);
+        display.setTextDatum(MC_DATUM);
+        display.drawString("?", x + 15, y - 12, 1);
+      }
       break;
   }
+}
+
+void drawBanner() {
+  if (!bannerAvailable) return;
+  banner.fillSprite(kBanner);
+  banner.fillRect(0, 0, 3, 20, kAccent);
+  banner.setTextColor(kText, kBanner);
+  banner.setTextFont(2);
+  banner.setTextDatum(ML_DATUM);
+  const int textWidth = banner.textWidth(trackTitle);
+  const int viewport = kBannerWidth - 16;
+  if (textWidth <= viewport) {
+    banner.drawString(trackTitle, 10, 10);
+  } else {
+    int cycle = textWidth + 40;
+    banner.drawString(trackTitle, 10 - bannerOffset, 10);
+    banner.drawString(trackTitle, 10 - bannerOffset + cycle, 10);
+    bannerOffset = (bannerOffset + 2) % cycle;
+  }
+  banner.pushSprite(8, kBannerY);
 }
 
 void clearArtwork() {
@@ -94,17 +147,27 @@ void clearArtwork() {
 }
 
 void drawInterface() {
-  display.fillScreen(kBackground);
+  for (int y = 0; y < 240; ++y) {
+    uint16_t color = display.color565(8 + y / 30, 12 + y / 24, 26 + y / 12);
+    display.drawFastHLine(0, y, 320, color);
+  }
+  display.drawLine(218, 0, 250, 210, 0x298B);
+  display.drawLine(225, 0, 257, 210, 0x1928);
+  display.fillRoundRect(4, 2, 208, 208, 3, 0x632D);
+  display.drawRoundRect(4, 2, 208, 208, 3, 0xB5B6);
+  display.drawFastHLine(7, 3, 202, TFT_WHITE);
+  display.drawFastVLine(5, 5, 201, 0xE71C);
+  display.drawFastHLine(7, 209, 202, 0x2104);
   display.setFreeFont(&FreeSans9pt7b);
   display.setTextColor(kText, kBackground);
   display.setTextDatum(MC_DATUM);
-  display.drawString("Spotify", 108, 230);
-  display.drawString("Discord", 264, 230);
-  display.drawFastVLine(224, 20, 200, kSurface);
   clearArtwork();
   for (const Button& button : buttons) {
     drawButton(button);
   }
+  display.drawFastHLine(8, kBannerY - 2, kBannerWidth, 0x4A8A);
+  bannerOffset = 0;
+  drawBanner();
 }
 
 bool mapTouch(const TouchCalibration& data, int rawX, int rawY, float& x, float& y) {
@@ -206,6 +269,11 @@ void setup() {
   display.setRotation(1);
   display.setSwapBytes(true);
   Serial.setTimeout(2000);
+  banner.setColorDepth(16);
+  bannerAvailable = banner.createSprite(kBannerWidth, 20) != nullptr;
+  if (!bannerAvailable) {
+    Serial.println("ERROR: banner allocation failed");
+  }
   touchSpi.begin(kTouchSck, kTouchMiso, kTouchMosi, kTouchCs);
   if (!touch.begin(touchSpi)) {
     display.fillScreen(TFT_BLACK);
@@ -239,14 +307,38 @@ void loop() {
       startCalibration();
     } else if (calibrating) {
       Serial.println("ERROR: complete touch calibration first");
+    } else if (command == "MIC:1" || command == "MIC:0" || command == "MIC:?") {
+      MuteState nextState = command == "MIC:1" ? MuteState::Muted
+                            : command == "MIC:0" ? MuteState::Unmuted : MuteState::Unknown;
+      if (nextState != muteState) {
+        muteState = nextState;
+        drawButton(buttons[3]);
+      }
+      lastMuteUpdate = millis();
+      Serial.println("MIC_OK");
     } else if (command == "ART") {
       receiveArtwork();
     } else if (command == "CLEAR") {
       clearArtwork();
       Serial.println("CLEARED");
+    } else if (command.startsWith("TITLE:")) {
+      trackTitle = command.substring(6);
+      if (trackTitle.length() == 0) trackTitle = "No track playing";
+      bannerOffset = 0;
+      drawBanner();
+      Serial.println("TITLE_OK");
     } else {
       Serial.println("ERROR: unknown command");
     }
+  }
+  if (!calibrating && muteState != MuteState::Unknown &&
+      millis() - lastMuteUpdate > 15000) {
+    muteState = MuteState::Unknown;
+    drawButton(buttons[3]);
+  }
+  if (!calibrating && millis() - lastBannerUpdate >= 50) {
+    lastBannerUpdate = millis();
+    drawBanner();
   }
   const bool isTouched = touch.touched();
   if (isTouched && !wasTouched) {

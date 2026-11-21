@@ -20,15 +20,18 @@ touch controller, pinout and calibration have not been verified.
 The ESP32 draws the buttons and sends button presses to Windows over USB
 serial. The Python companion sends media keys or a Discord hotkey and shows
 the current Spotify album artwork beside the controls, when Windows provides
-it. This is a still image, not video. The screen does not report Discord mute
-state; the Discord button is a toggle, not an indicator of whether the mic is
-muted. Media keys control whichever Windows media session receives them, not
+it. This is a still image, not video. The microphone button is red with a
+slash when Discord reports self-mute, purple when unmuted, and gray with a
+question mark when the state is unavailable. Media keys control whichever Windows media session receives them, not
 necessarily Spotify.
 
-The title-free layout uses 200x200 artwork, circular transport and microphone
-icon buttons, and FreeSans labels. Icons are actions, not playback or mute-state
-indicators. Firmware and the Python companion must be updated together because
-the artwork transfer size is fixed at both ends.
+The interface has framed 200x200 artwork, raised transport and microphone
+buttons, and a scrolling song, artist, and album banner. Spotify supplies metadata
+through Windows media controls; missing titles show "No track playing", and
+missing artist or album fields are omitted. The display font
+supports ASCII: accented Latin letters are simplified and other characters
+appear as `?`. The transport icon does not indicate playback state. Firmware and
+the Python companion must be updated together for artwork and title transfer.
 
 ## Setup
 
@@ -63,6 +66,26 @@ The board normally exposes a USB-to-serial connection, not a PC-driven display
 or a USB keyboard. No extra ESP32 or Raspberry Pi is needed. The serial port
 may reset the ESP32 when opened.
 
+## Actual Discord mute state
+
+The companion reads Discord's microphone toggle using Windows UI Automation
+through `discord-state.ps1`. It does not count button presses or read Discord
+tokens. Changes from the touchscreen, keyboard, or Discord itself are reflected
+while the control is accessible. This reads **self-mute**, not server mute or
+whether audio is reaching a voice channel.
+
+Discord must use an English UI and be launched with
+`--force-renderer-accessibility`. Quit Discord completely before launching
+its installed `Discord.exe` with this argument (or adding it to a shortcut
+that directly launches that executable). Repeat this after a normal Discord
+restart that omits the argument. The companion does not restart Discord for you.
+
+If Discord is closed, its microphone control is inaccessible (including on
+some minimized screens), or the monitor stops responding, the indicator becomes
+unknown rather than claiming the microphone is unmuted. The console reports
+the reason. A disconnected device also drops a stale known state after 15 seconds.
+Artwork transfers can briefly delay state updates.
+
 ## Development
 
 ```powershell
@@ -71,7 +94,7 @@ pio run
 ```
 
 The older `controller.ps1` is a media-key-only companion; use `controller.py`
-for album artwork and touch calibration support.
+for album artwork, touch calibration, and actual mute-state support.
 
 ## Troubleshooting
 

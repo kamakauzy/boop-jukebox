@@ -4,7 +4,11 @@ import ctypes
 from ctypes import wintypes
 import hashlib
 import io
+import json
+from pathlib import Path
+import subprocess
 import time
+import unicodedata
 
 from PIL import Image, ImageOps
 import serial
@@ -21,6 +25,37 @@ KEYS = {
     "NEXT": (0xB0,),
     "MUTE": (0x11, 0x36),
 }
+
+class DiscordMuteState:
+    def __init__(self):
+        self.muted = None
+        self.error = "Waiting for Discord mute state"
+        self.updated = 0
+
+    def update(self, line):
+        data = json.loads(line)
+        muted = data["muted"]
+        error = data["error"]
+        if muted is not None and type(muted) is not bool:
+            raise ValueError("Discord monitor sent an invalid mute state")
+        if error is not None and not isinstance(error, str):
+            raise ValueError("Discord monitor sent an invalid error")
+        if (muted is None) != (error is not None):
+            raise ValueError("Discord monitor sent an inconsistent state")
+        self.muted = muted
+        self.error = error
+        self.updated = time.monotonic()
+
+    def current(self):
+        if time.monotonic() - self.updated > 3:
+            return None, "Discord mute monitor is not responding"
+        return self.muted, self.error
+
+
+async def read_discord_state(process, state):
+    while line := await process.stdout.readline():
+        state.update(line)
+    raise RuntimeError("Discord mute monitor stopped unexpectedly")
 
 
 class KeyboardInput(ctypes.Structure):
@@ -82,15 +117,35 @@ def artwork_pixels(data):
     return bytes(result)
 
 
-async def spotify_artwork(manager):
+def display_text(text):
+    normalized = unicodedata.normalize("NFKD", text or "")
+    ascii_title = "".join(
+        char if 32 <= ord(char) <= 126 else " " if char.isspace()
+        else "" if unicodedata.combining(char) else "?"
+        for char in normalized
+    )
+    return " ".join(ascii_title.split())[:160]
+
+
+def display_track(properties):
+    if properties is None:
+        return "No track playing"
+    title = display_text(properties.title) or "No track playing"
+    artist = display_text(properties.artist)
+    album = display_text(properties.album_title)
+    return " | ".join(part for part in (title, artist, album) if part)
+
+
+async def spotify_properties(manager):
     session = next(
         (s for s in manager.get_sessions() if "spotify" in s.source_app_user_model_id.lower()),
         None,
     )
-    if session is None:
-        return None
-    properties = await session.try_get_media_properties_async()
-    if properties.thumbnail is None:
+    return await session.try_get_media_properties_async() if session is not None else None
+
+
+async def spotify_artwork(properties):
+    if properties is None or properties.thumbnail is None:
         return None
     stream = await properties.thumbnail.open_read_async()
     try:
@@ -153,8 +208,46 @@ class Device:
         self.port.write(b"CLEAR\n")
         self.wait_for("CLEARED")
 
+    def set_title(self, title):
+        self.port.write(f"TITLE:{title}\n".encode("ascii"))
+        self.wait_for("TITLE_OK")
+
+    def set_mute_state(self, muted):
+        if muted is not None and type(muted) is not bool:
+            raise ValueError("Mute state must be a boolean or unknown")
+        value = "?" if muted is None else ("1" if muted else "0")
+        self.port.write(f"MIC:{value}\n".encode("ascii"))
+        self.wait_for("MIC_OK")
+
 
 async def run(port_name, calibrate=False):
+    monitor = await asyncio.create_subprocess_exec(
+        "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+        "-File", str(Path(__file__).with_name("discord-state.ps1")),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    state = DiscordMuteState()
+    reader = asyncio.create_task(read_discord_state(monitor, state))
+    try:
+        await run_device(port_name, calibrate, state, reader)
+    finally:
+        reader.cancel()
+        try:
+            await reader
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if monitor.returncode is None:
+                monitor.terminate()
+            await monitor.wait()
+            stderr = (await monitor.stderr.read()).decode(errors="replace").strip()
+            if stderr:
+                print(f"Discord mute monitor: {stderr}", flush=True)
+
+
+async def run_device(port_name, calibrate, state, reader):
     manager = await MediaManager.request_async()
     with serial.Serial(port_name, 115200, timeout=0, write_timeout=3) as port:
         device = Device(port)
@@ -163,10 +256,16 @@ async def run(port_name, calibrate=False):
         if calibrate:
             port.write(b"CAL\n")
         last_art = object()
+        last_title = object()
         next_poll = 0
         last_error = None
         was_calibrating = None
+        last_mute = object()
+        last_mute_error = None
+        next_mute_poll = 0
         while True:
+            if reader.done():
+                await reader
             message = device.read_message()
             if message:
                 device.handle(message)
@@ -182,15 +281,27 @@ async def run(port_name, calibrate=False):
                     continue
                 if was_calibrating:
                     last_art = object()
+                    last_title = object()
+                    last_mute = object()
                     print("Touch calibration complete.", flush=True)
                 was_calibrating = False
                 try:
-                    pixels = await spotify_artwork(manager)
+                    properties = await spotify_properties(manager)
+                    title = display_track(properties)
                     last_error = None
                 except (OSError, RuntimeError, ValueError) as error:
                     if str(error) != last_error:
-                        print(f"Could not read Spotify artwork: {error}", flush=True)
+                        print(f"Could not read Spotify metadata: {error}", flush=True)
                         last_error = str(error)
+                    properties = None
+                    title = "No track playing"
+                if title != last_title:
+                    device.set_title(title)
+                    last_title = title
+                try:
+                    pixels = await spotify_artwork(properties)
+                except (OSError, RuntimeError, ValueError) as error:
+                    print(f"Could not read Spotify artwork: {error}", flush=True)
                     pixels = None
                 digest = hashlib.sha256(pixels).digest() if pixels is not None else None
                 if digest != last_art:
@@ -202,6 +313,16 @@ async def run(port_name, calibrate=False):
                         print("Spotify artwork updated", flush=True)
                     last_art = digest
                 next_poll = time.monotonic() + 5
+            if not was_calibrating and time.monotonic() >= next_mute_poll:
+                muted, error = state.current()
+                if error != last_mute_error and error is not None:
+                    print(f"Discord mute state unavailable: {error}", flush=True)
+                last_mute_error = error
+                device.set_mute_state(muted)
+                if muted != last_mute:
+                    print(f"Discord mute state: {muted}", flush=True)
+                    last_mute = muted
+                next_mute_poll = time.monotonic() + 0.5
             await asyncio.sleep(0.01)
 
 
